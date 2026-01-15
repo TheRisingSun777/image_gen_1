@@ -212,7 +212,7 @@ def main() -> int:
     parser.add_argument(
         "--max-passes",
         type=int,
-        default=5,
+        default=50,
         help="Max passes to re-queue missing outputs for guaranteed quantity.",
     )
     args = parser.parse_args()
