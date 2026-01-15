@@ -140,6 +140,10 @@ def write_progress_log(
     pct_total = (ok_total / total * 100.0) if total else 0.0
     now = datetime.now(TZ)
     elapsed_min = (now - run_start).total_seconds() / 60.0
+    avg_img_per_min = (ok_total / elapsed_min) if elapsed_min > 0 else 0.0
+    avg_sec_per_img = (60.0 / avg_img_per_min) if avg_img_per_min > 0 else 0.0
+    remaining = total - ok_total
+    eta_min = (remaining / avg_img_per_min) if avg_img_per_min > 0 else 0.0
 
     def green(text: str) -> str:
         return f"\x1b[32m{text}\x1b[0m"
@@ -156,13 +160,16 @@ def write_progress_log(
         f"Progress: {ok_total}/{total} ({pct_total:.2f}%) | "
         f"start: {format_ts(run_start)} | "
         f"elapsed_min: {elapsed_min:.2f} | "
+        f"avg_img/min: {avg_img_per_min:.2f} | "
+        f"avg_sec/img: {avg_sec_per_img:.1f} | "
+        f"eta_min: {eta_min:.1f} | "
         f"pass: {pass_num}/{max_passes} | "
         f"end: {format_ts(end_time)}\n"
     )
     table_header = (
-        "model  | wardrobe   | catalog | ok/total     | pct_group | pct_total\n"
+        "model  | wardrobe   | catalog | ok   | total | group_pct | total_pct\n"
     )
-    separator = "-------|------------|---------|--------------|-----------|----------\n"
+    separator = "-------|------------|---------|------|-------|-----------|----------\n"
 
     rows = []
     for key in sorted(totals.keys(), key=lambda k: (k[1], k[2])):
@@ -171,9 +178,9 @@ def write_progress_log(
         total_k = totals[key]
         pct_group = (ok / total_k * 100.0) if total_k else 0.0
         pct_of_total = (ok / total * 100.0) if total else 0.0
-        ok_total_str = f"{green(str(ok))}/{total_k}"
+        ok_str = green(str(ok))
         rows.append(
-            f"{model:6} | {wardrobe:10} | {catalog:7} | {ok_total_str:12} | {pct_group:9.2f} | {pct_of_total:8.2f}\n"
+            f"{model:6} | {wardrobe:10} | {catalog:7} | {ok_str:4} | {total_k:5d} | {pct_group:9.2f} | {pct_of_total:8.2f}\n"
         )
 
     with progress_path.open("w") as prog:
