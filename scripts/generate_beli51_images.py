@@ -115,6 +115,17 @@ def format_ts(ts: datetime | None) -> str:
     return ts.strftime("%Y-%m-%d %H:%M:%S%z")
 
 
+def is_503_error(msg: str) -> bool:
+    if not msg:
+        return False
+    return (
+        "503" in msg
+        or "UNAVAILABLE" in msg
+        or "Deadline expired" in msg
+        or "overloaded" in msg.lower()
+    )
+
+
 def write_progress_log(
     progress_path: Path,
     tasks: list[tuple[str, str, str, str, Path, Path, str, str, list[Path]]],
@@ -209,6 +220,24 @@ def main() -> int:
         type=int,
         default=60,
         help="Base delay in seconds when API returns 503/UNAVAILABLE.",
+    )
+    parser.add_argument(
+        "--max-503-attempts",
+        type=int,
+        default=1,
+        help="Max attempts per image when 503/UNAVAILABLE is detected (defer after).",
+    )
+    parser.add_argument(
+        "--cooldown-after-503s",
+        type=int,
+        default=5,
+        help="Consecutive 503s before a cooldown sleep.",
+    )
+    parser.add_argument(
+        "--cooldown-on-503",
+        type=int,
+        default=300,
+        help="Cooldown seconds after many consecutive 503s.",
     )
     parser.add_argument(
         "--per-image-timeout",
@@ -321,10 +350,12 @@ def main() -> int:
     )
 
     errors = 0
+    deferred = 0
     generation_counter = 1
     pass_num = 1
     max_passes = max(1, args.max_passes)
     completed = False
+    consecutive_503 = 0
     while pass_num <= max_passes:
         progress_made = 0
         for catalog, prompt_id, combo_id, prompt_text, combo_file, out_file, wardrobe, combo_specs, input_paths in tasks:
@@ -384,6 +415,7 @@ def main() -> int:
                 result = run_cmd(cmd, args.per_image_timeout)
                 if result.returncode == 0 and out_file.exists():
                     success = True
+                    consecutive_503 = 0
                     break
                 err = (result.stderr or result.stdout or "").strip()
                 if result.returncode == 0 and not out_file.exists():
@@ -391,9 +423,19 @@ def main() -> int:
                 last_err = err if err else f"exit status {result.returncode}"
                 with log_path.open("a") as log:
                     log.write(f"ERROR detail (attempt {attempt}/{args.max_attempts}): {last_err}\n")
+
+                if is_503_error(last_err):
+                    consecutive_503 += 1
+                    if consecutive_503 >= args.cooldown_after_503s:
+                        time.sleep(args.cooldown_on_503)
+                        consecutive_503 = 0
+                    # defer quickly on 503 to keep progress moving
+                    if attempt >= args.max_503_attempts:
+                        break
+
                 if attempt < args.max_attempts:
                     delay = min(args.retry_delay * (2 ** (attempt - 1)), args.max_retry_delay)
-                    if "503" in last_err or "UNAVAILABLE" in last_err or "Deadline expired" in last_err:
+                    if is_503_error(last_err):
                         delay = max(delay, args.retry_delay_503)
                     # small jitter to avoid thundering herd
                     delay = min(delay + random.uniform(0, 3), args.max_retry_delay)
@@ -403,11 +445,16 @@ def main() -> int:
             end_ts = datetime.now(TZ)
             duration_min = (end_ts - start_ts).total_seconds() / 60.0
             rel_path = str(out_file.relative_to(OUTPUT_BASE))
-            status = f"{'OK' if success else 'ERROR'}-P{pass_num}"
-            if not success:
-                errors += 1
-            else:
+            if success:
+                status = f"OK-P{pass_num}"
                 progress_made += 1
+            else:
+                if is_503_error(last_err):
+                    status = f"DEFER-P{pass_num}"
+                    deferred += 1
+                else:
+                    status = f"ERROR-P{pass_num}"
+                    errors += 1
 
             row = (
                 f"{generation_counter:4d} | "
@@ -454,6 +501,8 @@ def main() -> int:
             )
         if errors:
             log.write(f"Errors: {errors}\n")
+        if deferred:
+            log.write(f"Deferred (503/UNAVAILABLE): {deferred}\n")
     with md_log_path.open("a") as mdlog:
         mdlog.write("```\n")
         if completed:
@@ -465,6 +514,8 @@ def main() -> int:
             )
         if errors:
             mdlog.write(f"Errors: {errors}\n")
+        if deferred:
+            mdlog.write(f"Deferred (503/UNAVAILABLE): {deferred}\n")
 
     write_progress_log(progress_log_path, tasks, run_start, pass_num, max_passes, end_time=end_time)
 
