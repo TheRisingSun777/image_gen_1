@@ -331,7 +331,7 @@ def main() -> int:
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=1,
+        default=5,
         help="Initial concurrent workers.",
     )
     parser.add_argument(
@@ -343,7 +343,7 @@ def main() -> int:
     parser.add_argument(
         "--max-concurrency",
         type=int,
-        default=3,
+        default=5,
         help="Maximum concurrent workers.",
     )
     parser.add_argument(
