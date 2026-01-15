@@ -79,6 +79,8 @@ def load_env_file(path: Path) -> None:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        if line.startswith("export "):
+            line = line[len("export ") :]
         key, val = line.split("=", 1)
         key = key.strip()
         val = val.strip().strip('"').strip("'")
@@ -376,6 +378,9 @@ def main() -> int:
     args = parser.parse_args()
 
     load_env_file(Path(args.env_file))
+    if "GEMINI_API_KEY_2" in os.environ:
+        os.environ["GEMINI_API_KEY"] = os.environ["GEMINI_API_KEY_2"]
+        print("Using GEMINI_API_KEY_2")
     if "GEMINI_API_KEY" not in os.environ:
         raise RuntimeError("GEMINI_API_KEY is not set. Source your .env first.")
 
