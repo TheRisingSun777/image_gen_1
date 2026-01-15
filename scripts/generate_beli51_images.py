@@ -18,9 +18,10 @@ import os
 import re
 import subprocess
 import time
+from collections import defaultdict
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 PROMPT_BASE = Path("/Users/adil/Docs/Oracle/Content/Prompt_book/beli51/distilled")
@@ -98,8 +99,76 @@ def read_combo_env(path: Path) -> dict[str, str]:
     return data
 
 
-def run_cmd(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, text=True, capture_output=True)
+def run_cmd(cmd: list[str], timeout_s: int) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd, returncode=124, stdout="", stderr=f"TIMEOUT after {timeout_s}s"
+        )
+
+
+def format_ts(ts: datetime | None) -> str:
+    if ts is None:
+        return "-"
+    return ts.strftime("%Y-%m-%d %H:%M:%S%z")
+
+
+def write_progress_log(
+    progress_path: Path,
+    tasks: list[tuple[str, str, str, str, Path, Path, str, str, list[Path]]],
+    run_start: datetime,
+    pass_num: int,
+    max_passes: int,
+    end_time: datetime | None = None,
+) -> None:
+    total = len(tasks)
+    ok_total = sum(1 for t in tasks if t[5].exists())
+    pct_total = (ok_total / total * 100.0) if total else 0.0
+    now = datetime.now(TZ)
+    elapsed_min = (now - run_start).total_seconds() / 60.0
+
+    def green(text: str) -> str:
+        return f"\x1b[32m{text}\x1b[0m"
+
+    totals: dict[tuple[str, str, str], int] = defaultdict(int)
+    oks: dict[tuple[str, str, str], int] = defaultdict(int)
+    for catalog, prompt_id, combo_id, prompt_text, combo_file, out_file, wardrobe, combo_specs, input_paths in tasks:
+        key = (MODEL_NAME, wardrobe, catalog)
+        totals[key] += 1
+        if out_file.exists():
+            oks[key] += 1
+
+    header = (
+        f"Progress: {ok_total}/{total} ({pct_total:.2f}%) | "
+        f"start: {format_ts(run_start)} | "
+        f"elapsed_min: {elapsed_min:.2f} | "
+        f"pass: {pass_num}/{max_passes} | "
+        f"end: {format_ts(end_time)}\n"
+    )
+    table_header = (
+        "model  | wardrobe   | catalog | ok/total     | pct_group | pct_total\n"
+    )
+    separator = "-------|------------|---------|--------------|-----------|----------\n"
+
+    rows = []
+    for key in sorted(totals.keys(), key=lambda k: (k[1], k[2])):
+        model, wardrobe, catalog = key
+        ok = oks.get(key, 0)
+        total_k = totals[key]
+        pct_group = (ok / total_k * 100.0) if total_k else 0.0
+        pct_of_total = (ok / total * 100.0) if total else 0.0
+        ok_total_str = f"{green(str(ok))}/{total_k}"
+        rows.append(
+            f"{model:6} | {wardrobe:10} | {catalog:7} | {ok_total_str:12} | {pct_group:9.2f} | {pct_of_total:8.2f}\n"
+        )
+
+    with progress_path.open("w") as prog:
+        prog.write(header)
+        prog.write(table_header)
+        prog.write(separator)
+        for row in rows:
+            prog.write(row)
 
 
 def main() -> int:
@@ -129,6 +198,18 @@ def main() -> int:
         help="Seconds to wait between retries.",
     )
     parser.add_argument(
+        "--max-retry-delay",
+        type=int,
+        default=120,
+        help="Max backoff delay in seconds between retries.",
+    )
+    parser.add_argument(
+        "--per-image-timeout",
+        type=int,
+        default=600,
+        help="Timeout in seconds for a single image generation call.",
+    )
+    parser.add_argument(
         "--max-passes",
         type=int,
         default=5,
@@ -144,6 +225,7 @@ def main() -> int:
     now_local = datetime.now(TZ)
     log_path = LOG_DIR / f"full_run_{now_local.strftime('%Y-%m-%d_%H-%M-%S%z')}_almaty.log"
     md_log_path = log_path.with_suffix(".md")
+    progress_log_path = LOG_DIR / f"progress_{now_local.strftime('%Y-%m-%d_%H-%M-%S%z')}_almaty.log"
 
     selected_catalogs = CATALOGS
     if args.catalog:
@@ -172,7 +254,7 @@ def main() -> int:
 
     print(f"Logging to: {log_path}")
 
-    tasks: list[tuple[str, str, str, str, Path, Path, str]] = []
+    tasks: list[tuple[str, str, str, str, Path, Path, str, str, list[Path]]] = []
     for catalog, prompts in selected_catalogs:
         for prompt_id in prompts:
             prefix_match = re.match(r"^[A-Z]+", prompt_id)
@@ -190,30 +272,56 @@ def main() -> int:
                 combo_id = combo_file.stem
                 out_dir = OUTPUT_BASE / wardrobe / catalog / prompt_id / combo_id
                 out_file = out_dir / f"{catalog}_{prompt_id}_{combo_id}.png"
-                tasks.append((catalog, prompt_id, combo_id, prompt_text, combo_file, out_file, wardrobe))
+                env = read_combo_env(combo_file)
+                key_order = ["WARDROBE", "BOTTOM", "POSE", "UI"]
+                present_keys = [k for k in key_order if k in env]
+                if not present_keys:
+                    raise KeyError(f"No reference keys found in {combo_file}")
+                input_paths = [ASSET_BASE / env[k] for k in present_keys]
+                for p in input_paths:
+                    if not p.exists():
+                        raise FileNotFoundError(f"Missing input image: {p}")
+                combo_specs = ",".join(present_keys)
+                tasks.append(
+                    (
+                        catalog,
+                        prompt_id,
+                        combo_id,
+                        prompt_text,
+                        combo_file,
+                        out_file,
+                        wardrobe,
+                        combo_specs,
+                        input_paths,
+                    )
+                )
 
     print(f"Total images queued: {len(tasks)}")
+    run_start = now_local
+    write_progress_log(
+        progress_log_path,
+        tasks,
+        run_start,
+        pass_num=0,
+        max_passes=max(1, args.max_passes),
+        end_time=None,
+    )
 
     errors = 0
     generation_counter = 1
     pass_num = 1
     max_passes = max(1, args.max_passes)
+    completed = False
     while pass_num <= max_passes:
-        for catalog, prompt_id, combo_id, prompt_text, combo_file, out_file, wardrobe in tasks:
+        progress_made = 0
+        for catalog, prompt_id, combo_id, prompt_text, combo_file, out_file, wardrobe, combo_specs, input_paths in tasks:
             out_dir = out_file.parent
             out_dir.mkdir(parents=True, exist_ok=True)
-
-            env = read_combo_env(combo_file)
-            key_order = ["WARDROBE", "BOTTOM", "POSE", "UI"]
-            present_keys = [k for k in key_order if k in env]
-            if not present_keys:
-                raise KeyError(f"No reference keys found in {combo_file}")
 
             if out_file.exists():
                 now_ts = datetime.now(TZ)
                 duration_min = 0.0
                 rel_path = str(out_file.relative_to(OUTPUT_BASE))
-                combo_specs = ",".join(present_keys)
                 status = f"SKIP-P{pass_num}"
                 row = (
                     f"{generation_counter:4d} | "
@@ -235,54 +343,55 @@ def main() -> int:
                 with md_log_path.open("a") as mdlog:
                     mdlog.write(row)
                 generation_counter += 1
+                write_progress_log(progress_log_path, tasks, run_start, pass_num, max_passes)
                 continue
-
-            input_paths = [ASSET_BASE / env[k] for k in present_keys]
-            for p in input_paths:
-                if not p.exists():
-                    raise FileNotFoundError(f"Missing input image: {p}")
 
             msg = f"[{generation_counter}] {catalog} {prompt_id} {combo_id} -> {out_file}"
             print(msg)
             start_ts = datetime.now(TZ)
 
-        cmd = [
-            "uv",
-            "run",
-            str(Path.home() / ".codex/skills/nano-banana-pro/scripts/generate_image.py"),
-            "--prompt",
-            prompt_text,
-            "--filename",
-            str(out_file),
-            "--resolution",
-            "2K",
-        ]
-        for p in input_paths:
-            cmd.extend(["--input-image", str(p)])
+            cmd = [
+                "uv",
+                "run",
+                str(Path.home() / ".codex/skills/nano-banana-pro/scripts/generate_image.py"),
+                "--prompt",
+                prompt_text,
+                "--filename",
+                str(out_file),
+                "--resolution",
+                "2K",
+            ]
+            for p in input_paths:
+                cmd.extend(["--input-image", str(p)])
 
             attempt = 1
             success = False
             last_err = ""
             while attempt <= args.max_attempts:
-                result = run_cmd(cmd)
-                if result.returncode == 0:
+                result = run_cmd(cmd, args.per_image_timeout)
+                if result.returncode == 0 and out_file.exists():
                     success = True
                     break
                 err = (result.stderr or result.stdout or "").strip()
+                if result.returncode == 0 and not out_file.exists():
+                    err = "Completed with success code but output file missing."
                 last_err = err if err else f"exit status {result.returncode}"
                 with log_path.open("a") as log:
                     log.write(f"ERROR detail (attempt {attempt}/{args.max_attempts}): {last_err}\n")
                 if attempt < args.max_attempts:
-                    time.sleep(args.retry_delay)
+                    delay = min(args.retry_delay * (2 ** (attempt - 1)), args.max_retry_delay)
+                    time.sleep(delay)
                 attempt += 1
 
             end_ts = datetime.now(TZ)
             duration_min = (end_ts - start_ts).total_seconds() / 60.0
-            combo_specs = ",".join(present_keys)
             rel_path = str(out_file.relative_to(OUTPUT_BASE))
             status = f"{'OK' if success else 'ERROR'}-P{pass_num}"
             if not success:
                 errors += 1
+            else:
+                progress_made += 1
+
             row = (
                 f"{generation_counter:4d} | "
                 f"{start_ts.strftime('%Y-%m-%d %H:%M:%S%z')} | "
@@ -304,21 +413,41 @@ def main() -> int:
             with md_log_path.open("a") as mdlog:
                 mdlog.write(row)
             generation_counter += 1
+            write_progress_log(progress_log_path, tasks, run_start, pass_num, max_passes)
 
-        missing = [out for *_, out, _ in tasks if not out.exists()]
+        missing = [t[5] for t in tasks if not t[5].exists()]
         if not missing:
+            completed = True
             break
         pass_num += 1
+        if progress_made == 0:
+            time.sleep(30)
 
+    end_time = datetime.now(TZ)
+    missing = [t[5] for t in tasks if not t[5].exists()]
     with log_path.open("a") as log:
-        log.write(f"Run completed (Asia/Almaty): {datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S%z')}\n")
+        if completed:
+            log.write(f"Run completed (Asia/Almaty): {end_time.strftime('%Y-%m-%d %H:%M:%S%z')}\n")
+        else:
+            log.write(
+                f"Run ended incomplete (Asia/Almaty): {end_time.strftime('%Y-%m-%d %H:%M:%S%z')} | "
+                f"missing: {len(missing)} | passes: {pass_num - 1}\n"
+            )
         if errors:
             log.write(f"Errors: {errors}\n")
     with md_log_path.open("a") as mdlog:
         mdlog.write("```\n")
-        mdlog.write(f"Run completed (Asia/Almaty): {datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S%z')}\n")
+        if completed:
+            mdlog.write(f"Run completed (Asia/Almaty): {end_time.strftime('%Y-%m-%d %H:%M:%S%z')}\n")
+        else:
+            mdlog.write(
+                f"Run ended incomplete (Asia/Almaty): {end_time.strftime('%Y-%m-%d %H:%M:%S%z')} | "
+                f"missing: {len(missing)} | passes: {pass_num - 1}\n"
+            )
         if errors:
             mdlog.write(f"Errors: {errors}\n")
+
+    write_progress_log(progress_log_path, tasks, run_start, pass_num, max_passes, end_time=end_time)
 
     print("Done.")
     return 0
