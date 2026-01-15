@@ -19,7 +19,8 @@ import re
 import subprocess
 import time
 import random
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -183,6 +184,75 @@ def write_progress_log(
             prog.write(row)
 
 
+def process_task(
+    task: tuple[str, str, str, str, Path, Path, str, str, list[Path]],
+    args: argparse.Namespace,
+    gen_id: int,
+    start_ts: datetime,
+    pass_num: int,
+) -> dict:
+    catalog, prompt_id, combo_id, prompt_text, combo_file, out_file, wardrobe, combo_specs, input_paths = task
+    cmd = [
+        "uv",
+        "run",
+        str(Path.home() / ".codex/skills/nano-banana-pro/scripts/generate_image.py"),
+        "--prompt",
+        prompt_text,
+        "--filename",
+        str(out_file),
+        "--resolution",
+        "2K",
+    ]
+    for p in input_paths:
+        cmd.extend(["--input-image", str(p)])
+
+    attempt = 1
+    success = False
+    last_err = ""
+    while attempt <= args.max_attempts:
+        result = run_cmd(cmd, args.per_image_timeout)
+        if result.returncode == 0 and out_file.exists():
+            success = True
+            break
+        err = (result.stderr or result.stdout or "").strip()
+        if result.returncode == 0 and not out_file.exists():
+            err = "Completed with success code but output file missing."
+        last_err = err if err else f"exit status {result.returncode}"
+        if is_503_error(last_err) and attempt >= args.max_503_attempts:
+            break
+        if attempt < args.max_attempts:
+            delay = min(args.retry_delay * (2 ** (attempt - 1)), args.max_retry_delay)
+            if is_503_error(last_err):
+                delay = max(delay, args.retry_delay_503)
+            delay = min(delay + random.uniform(0, 3), args.max_retry_delay)
+            time.sleep(delay)
+        attempt += 1
+
+    end_ts = datetime.now(TZ)
+    duration_min = (end_ts - start_ts).total_seconds() / 60.0
+    is_503 = is_503_error(last_err)
+    if success:
+        status = f"OK-P{pass_num}"
+    else:
+        status = f"{'DEFER' if is_503 else 'ERROR'}-P{pass_num}"
+
+    return {
+        "gen_id": gen_id,
+        "catalog": catalog,
+        "prompt_id": prompt_id,
+        "combo_id": combo_id,
+        "wardrobe": wardrobe,
+        "combo_specs": combo_specs,
+        "out_file": out_file,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "duration_min": duration_min,
+        "status": status,
+        "last_err": last_err,
+        "is_503": is_503,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate beli51 images using Nano Banana Pro with Orange UI combos."
@@ -250,6 +320,42 @@ def main() -> int:
         type=int,
         default=3,
         help="Seconds to wait between images to reduce rate spikes.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Initial concurrent workers.",
+    )
+    parser.add_argument(
+        "--min-concurrency",
+        type=int,
+        default=1,
+        help="Minimum concurrent workers.",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=3,
+        help="Maximum concurrent workers.",
+    )
+    parser.add_argument(
+        "--adapt-window",
+        type=int,
+        default=10,
+        help="Rolling window size for adaptive concurrency (based on 503s).",
+    )
+    parser.add_argument(
+        "--adapt-up-threshold",
+        type=float,
+        default=0.1,
+        help="If 503 rate <= threshold, increase concurrency.",
+    )
+    parser.add_argument(
+        "--adapt-down-threshold",
+        type=float,
+        default=0.4,
+        help="If 503 rate >= threshold, decrease concurrency.",
     )
     parser.add_argument(
         "--max-passes",
@@ -355,13 +461,18 @@ def main() -> int:
     pass_num = 1
     max_passes = max(1, args.max_passes)
     completed = False
+    target = max(args.min_concurrency, min(args.concurrency, args.max_concurrency))
+    window = deque(maxlen=max(1, args.adapt_window))
     consecutive_503 = 0
+
     while pass_num <= max_passes:
         progress_made = 0
-        for catalog, prompt_id, combo_id, prompt_text, combo_file, out_file, wardrobe, combo_specs, input_paths in tasks:
+        pending = []
+
+        for task in tasks:
+            catalog, prompt_id, combo_id, prompt_text, combo_file, out_file, wardrobe, combo_specs, input_paths = task
             out_dir = out_file.parent
             out_dir.mkdir(parents=True, exist_ok=True)
-
             if out_file.exists():
                 now_ts = datetime.now(TZ)
                 duration_min = 0.0
@@ -388,98 +499,84 @@ def main() -> int:
                     mdlog.write(row)
                 generation_counter += 1
                 write_progress_log(progress_log_path, tasks, run_start, pass_num, max_passes)
-                continue
+            else:
+                pending.append(task)
 
-            msg = f"[{generation_counter}] {catalog} {prompt_id} {combo_id} -> {out_file}"
-            print(msg)
-            start_ts = datetime.now(TZ)
+        if not pending:
+            completed = True
+            break
 
-            cmd = [
-                "uv",
-                "run",
-                str(Path.home() / ".codex/skills/nano-banana-pro/scripts/generate_image.py"),
-                "--prompt",
-                prompt_text,
-                "--filename",
-                str(out_file),
-                "--resolution",
-                "2K",
-            ]
-            for p in input_paths:
-                cmd.extend(["--input-image", str(p)])
+        with ThreadPoolExecutor(max_workers=args.max_concurrency) as executor:
+            active = set()
+            future_map = {}
+            pending_index = 0
 
-            attempt = 1
-            success = False
-            last_err = ""
-            while attempt <= args.max_attempts:
-                result = run_cmd(cmd, args.per_image_timeout)
-                if result.returncode == 0 and out_file.exists():
-                    success = True
-                    consecutive_503 = 0
+            while pending_index < len(pending) or active:
+                while pending_index < len(pending) and len(active) < target:
+                    task = pending[pending_index]
+                    pending_index += 1
+                    start_ts = datetime.now(TZ)
+                    gen_id = generation_counter
+                    generation_counter += 1
+                    fut = executor.submit(process_task, task, args, gen_id, start_ts, pass_num)
+                    active.add(fut)
+                    future_map[fut] = task
+                    if args.inter_image_delay > 0:
+                        time.sleep(args.inter_image_delay)
+
+                if not active:
                     break
-                err = (result.stderr or result.stdout or "").strip()
-                if result.returncode == 0 and not out_file.exists():
-                    err = "Completed with success code but output file missing."
-                last_err = err if err else f"exit status {result.returncode}"
-                with log_path.open("a") as log:
-                    log.write(f"ERROR detail (attempt {attempt}/{args.max_attempts}): {last_err}\n")
 
-                if is_503_error(last_err):
-                    consecutive_503 += 1
+                done, active = wait(active, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    res = fut.result()
+                    rel_path = str(res["out_file"].relative_to(OUTPUT_BASE))
+                    row = (
+                        f"{res['gen_id']:4d} | "
+                        f"{res['start_ts'].strftime('%Y-%m-%d %H:%M:%S%z')} | "
+                        f"{res['end_ts'].strftime('%Y-%m-%d %H:%M:%S%z')} | "
+                        f"{res['duration_min']:12.2f} | "
+                        f"{res['status']:8} | "
+                        f"{MODEL_NAME:6} | "
+                        f"{res['wardrobe']:10} | "
+                        f"{res['catalog']:7} | "
+                        f"{res['prompt_id']:6} | "
+                        f"{res['combo_id']:7} | "
+                        f"{res['combo_specs']:21} | "
+                        f"{rel_path}\n"
+                    )
+                    with log_path.open("a") as log:
+                        log.write(row)
+                        if res["status"].startswith("ERROR") and res["last_err"]:
+                            log.write(f"ERROR detail (final): {res['last_err']}\n")
+                    with md_log_path.open("a") as mdlog:
+                        mdlog.write(row)
+
+                    if res["status"].startswith("OK"):
+                        progress_made += 1
+                    if res["status"].startswith("ERROR"):
+                        errors += 1
+                    if res["status"].startswith("DEFER"):
+                        deferred += 1
+
+                    if res["is_503"]:
+                        consecutive_503 += 1
+                    else:
+                        consecutive_503 = 0
+
+                    window.append(1 if res["is_503"] else 0)
+                    if len(window) == window.maxlen:
+                        rate = sum(window) / len(window)
+                        if rate >= args.adapt_down_threshold and target > args.min_concurrency:
+                            target -= 1
+                        elif rate <= args.adapt_up_threshold and target < args.max_concurrency:
+                            target += 1
+
                     if consecutive_503 >= args.cooldown_after_503s:
                         time.sleep(args.cooldown_on_503)
                         consecutive_503 = 0
-                    # defer quickly on 503 to keep progress moving
-                    if attempt >= args.max_503_attempts:
-                        break
 
-                if attempt < args.max_attempts:
-                    delay = min(args.retry_delay * (2 ** (attempt - 1)), args.max_retry_delay)
-                    if is_503_error(last_err):
-                        delay = max(delay, args.retry_delay_503)
-                    # small jitter to avoid thundering herd
-                    delay = min(delay + random.uniform(0, 3), args.max_retry_delay)
-                    time.sleep(delay)
-                attempt += 1
-
-            end_ts = datetime.now(TZ)
-            duration_min = (end_ts - start_ts).total_seconds() / 60.0
-            rel_path = str(out_file.relative_to(OUTPUT_BASE))
-            if success:
-                status = f"OK-P{pass_num}"
-                progress_made += 1
-            else:
-                if is_503_error(last_err):
-                    status = f"DEFER-P{pass_num}"
-                    deferred += 1
-                else:
-                    status = f"ERROR-P{pass_num}"
-                    errors += 1
-
-            row = (
-                f"{generation_counter:4d} | "
-                f"{start_ts.strftime('%Y-%m-%d %H:%M:%S%z')} | "
-                f"{end_ts.strftime('%Y-%m-%d %H:%M:%S%z')} | "
-                f"{duration_min:12.2f} | "
-                f"{status:8} | "
-                f"{MODEL_NAME:6} | "
-                f"{wardrobe:10} | "
-                f"{catalog:7} | "
-                f"{prompt_id:6} | "
-                f"{combo_id:7} | "
-                f"{combo_specs:21} | "
-                f"{rel_path}\n"
-            )
-            with log_path.open("a") as log:
-                log.write(row)
-                if not success and last_err:
-                    log.write(f"ERROR detail (final): {last_err}\n")
-            with md_log_path.open("a") as mdlog:
-                mdlog.write(row)
-            generation_counter += 1
-            if args.inter_image_delay > 0:
-                time.sleep(args.inter_image_delay)
-            write_progress_log(progress_log_path, tasks, run_start, pass_num, max_passes)
+                    write_progress_log(progress_log_path, tasks, run_start, pass_num, max_passes)
 
         missing = [t[5] for t in tasks if not t[5].exists()]
         if not missing:
