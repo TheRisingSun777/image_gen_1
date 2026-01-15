@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import time
+import random
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -204,10 +205,22 @@ def main() -> int:
         help="Max backoff delay in seconds between retries.",
     )
     parser.add_argument(
+        "--retry-delay-503",
+        type=int,
+        default=60,
+        help="Base delay in seconds when API returns 503/UNAVAILABLE.",
+    )
+    parser.add_argument(
         "--per-image-timeout",
         type=int,
-        default=600,
+        default=900,
         help="Timeout in seconds for a single image generation call.",
+    )
+    parser.add_argument(
+        "--inter-image-delay",
+        type=int,
+        default=3,
+        help="Seconds to wait between images to reduce rate spikes.",
     )
     parser.add_argument(
         "--max-passes",
@@ -380,6 +393,10 @@ def main() -> int:
                     log.write(f"ERROR detail (attempt {attempt}/{args.max_attempts}): {last_err}\n")
                 if attempt < args.max_attempts:
                     delay = min(args.retry_delay * (2 ** (attempt - 1)), args.max_retry_delay)
+                    if "503" in last_err or "UNAVAILABLE" in last_err or "Deadline expired" in last_err:
+                        delay = max(delay, args.retry_delay_503)
+                    # small jitter to avoid thundering herd
+                    delay = min(delay + random.uniform(0, 3), args.max_retry_delay)
                     time.sleep(delay)
                 attempt += 1
 
@@ -413,6 +430,8 @@ def main() -> int:
             with md_log_path.open("a") as mdlog:
                 mdlog.write(row)
             generation_counter += 1
+            if args.inter_image_delay > 0:
+                time.sleep(args.inter_image_delay)
             write_progress_log(progress_log_path, tasks, run_start, pass_num, max_passes)
 
         missing = [t[5] for t in tasks if not t[5].exists()]
