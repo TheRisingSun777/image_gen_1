@@ -33,6 +33,9 @@ OUTPUT_BASE = Path(
     "/Users/adil/Docs/Business2/Content/Content_db_1/Kevin/beli51/Result_images"
 )
 LOG_DIR = Path("/Users/adil/Docs/Oracle/Content/docs/generation_logs")
+LOG_DIR_MAIN = LOG_DIR / "main"
+LOG_DIR_PROGRESS = LOG_DIR / "progress"
+LOG_DIR_MD = LOG_DIR / "md"
 MODEL_NAME = "beli51"
 TZ = ZoneInfo("Asia/Almaty")
 
@@ -376,11 +379,13 @@ def main() -> int:
     if "GEMINI_API_KEY" not in os.environ:
         raise RuntimeError("GEMINI_API_KEY is not set. Source your .env first.")
 
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR_MAIN.mkdir(parents=True, exist_ok=True)
+    LOG_DIR_PROGRESS.mkdir(parents=True, exist_ok=True)
+    LOG_DIR_MD.mkdir(parents=True, exist_ok=True)
     now_local = datetime.now(TZ)
-    log_path = LOG_DIR / f"full_run_{now_local.strftime('%Y-%m-%d_%H-%M-%S%z')}_almaty.log"
-    md_log_path = log_path.with_suffix(".md")
-    progress_log_path = LOG_DIR / f"progress_{now_local.strftime('%Y-%m-%d_%H-%M-%S%z')}_almaty.log"
+    log_path = LOG_DIR_MAIN / f"full_run_{now_local.strftime('%Y-%m-%d_%H-%M-%S%z')}_almaty.log"
+    md_log_path = LOG_DIR_MD / f"full_run_{now_local.strftime('%Y-%m-%d_%H-%M-%S%z')}_almaty.md"
+    progress_log_path = LOG_DIR_PROGRESS / f"progress_{now_local.strftime('%Y-%m-%d_%H-%M-%S%z')}_almaty.log"
 
     selected_catalogs = CATALOGS
     if args.catalog:
